@@ -5,13 +5,17 @@
 #include <esp_idf_version.h>
 
 // === Public API ===
-bool EspNow_init(const uint8_t peer_mac[6]);   // setup WiFi STA, esp_now, register callbacks
-bool EspNow_send(const String& line);          // send a String to peer
-void EspNow_loop();                            // poll internal RX queue and dispatch to callback
+bool EspNow_init(const uint8_t peer_mac[6]);
+bool EspNow_send(const String& line);
+void EspNow_loop();
 
-// Command callback that your main will set (e.g., handleCommandLine)
+// Command callback
 typedef void (*EspNowCommandCallback)(const String& cmd);
 void EspNow_setCommandCallback(EspNowCommandCallback cb);
 
-// Stats
+// Stats / debug
 uint32_t EspNow_txCount();
+uint32_t EspNow_rxCount();
+uint32_t EspNow_rxDroppedCount();
+uint32_t EspNow_rxTruncatedCount();
+uint32_t EspNow_sendFailCount();

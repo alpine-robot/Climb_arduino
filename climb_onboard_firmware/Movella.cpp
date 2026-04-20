@@ -66,6 +66,21 @@ void Movella::printCSV(Stream& out) const {
 
 // ---------- private ----------
 
+// Xbus checksum: 1 byte, two's complement, so that:
+// (sum of bytes from BID to end of PAYLOAD + CHECKSUM) mod 256 == 0
+static bool verifyXbusChecksum(const uint8_t* frame, int payloadLen) {
+  // frame layout (when assembled in readXbusPacket):
+  // [0]=PREAMBLE, [1]=BID, [2]=MID, [3]=LEN, [4..4+LEN-1]=PAYLOAD, [4+LEN]=CHECKSUM
+  uint8_t sum = 0;
+  for (int k = 1; k <= 3 + payloadLen; ++k) { // BID..LEN..PAYLOAD
+    sum = uint8_t(sum + frame[k]);
+  }
+  sum = uint8_t(sum + frame[4 + payloadLen]); // checksum byte
+  return (sum == 0);
+}
+
+
+
 bool Movella::readXbusPacket() {
   while (serial_.available()) {
     uint8_t b = serial_.read();
@@ -109,7 +124,16 @@ bool Movella::readXbusPacket() {
     // Frame size = preamble(1) + bid(1) + mid(1) + len(1) + payload(len) + checksum(1)
     // We've currently filled idx_ bytes; when idx_ == 5 + pktLen_ we have full frame.
     if (idx_ == pktLen_ + 5) {
-      // (Optional: verify checksum if desired)
+      // Verify checksum BEFORE accepting
+      if (!verifyXbusChecksum(buf_, pktLen_)) {
+        // bad frame -> drop
+        badCkFrames_++;
+        inPacket_ = false;
+        idx_ = 0;
+        continue;
+      }
+      goodFrames_++;
+
       inPacket_ = false;
       int payloadStart = 4;      // buf_[4] .. buf_[4+pktLen_-1]
       // Shift payload to the beginning of buf_ for simpler parsing
@@ -179,3 +203,19 @@ bool Movella::parseGyro(const uint8_t* buffer, int length, float gyro[3]) {
   }
   return false;
 }
+
+
+
+
+// ==============================
+// Debug (optional) in climb_onboard_firmware.ino
+// ==============================
+// into EspNowTxTask() or loop() you can print every second:
+//
+//   static uint32_t t0 = 0;
+//   if (millis() - t0 > 1000) {
+//     t0 = millis();
+//     Serial.printf("IMU1 good=%lu badCk=%lu\n", (unsigned long)imu1.goodFrames(), (unsigned long)imu1.badChecksumFrames());
+//   }
+//
+

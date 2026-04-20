@@ -26,6 +26,9 @@ public:
   // Your own tag for the source (e.g., which IMU this is)
   int id() const { return id_; }
 
+  uint32_t goodFrames() const { return goodFrames_; }
+  uint32_t badChecksumFrames() const { return badCkFrames_; }
+
 private:
   // Internal helpers
   bool readXbusPacket();
@@ -54,4 +57,7 @@ private:
   unsigned long lastTickMs_ = 0;
   int           counter_    = 0;
   float         freq_       = 0.f;
+
+  uint32_t goodFrames_ = 0;
+  uint32_t badCkFrames_ = 0;
 };
