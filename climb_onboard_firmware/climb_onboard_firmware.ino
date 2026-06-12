@@ -92,42 +92,77 @@ Movella imu2(Xsens2, 2);
 volatile uint32_t lastThrCmdMs = 0;
 static constexpr uint32_t THR_TIMEOUT_MS = 500; //300
 
-volatile float cmdFx = 0.0f;   // body-frame force x
-volatile float cmdFy = 0.0f;   // body-frame force y
-volatile float cmdMz = 0.0f;   // body-frame yaw moment
+// ── ESP-NOW telemetry health / auto-recovery ─────────────────
+volatile bool g_espnowHealthy = false;
+volatile uint32_t g_espnowConsecutiveSendFails = 0;
+volatile uint32_t g_espnowLastOkTxMs = 0;
+volatile uint32_t g_espnowLastReinitMs = 0;
+static constexpr uint32_t ESPNOW_REINIT_COOLDOWN_MS = 2000;
+static constexpr uint32_t ESPNOW_STALE_MS = 1000;
+static constexpr uint32_t ESPNOW_FAIL_THRESHOLD = 5;
 
-volatile bool propCtrlEnabled = true;   // laterali da comando ROS/ESP-NOW
+
+volatile float cmdFx = 0.0f;   // body-frame force x request from high level
+volatile float cmdFy = 0.0f;   // body-frame force y request from high level
+volatile float cmdMz = 0.0f;   // open-loop yaw moment request from high level
+
+volatile bool propCtrlEnabled = true;   // lateral wrench from ROS/ESP-NOW enabled
+volatile bool yawCtlEnabled   = false;  // IMU-based yaw hold enabled
+
+// Final thruster configuration (already agreed with wiring):
+// T1 = Y1 = CW   , Pack A
+// T2 = Y2 = CCW  , Pack A
+// T3 = Y3 = CCW  , Pack B
+// T4 = Y4 = CW   , Pack B
+// T5 = P1 = CW   , Pack A  (pitch +)
+// T6 = P2 = CCW  , Pack B  (pitch -)
+// Yaw +  => T1 + T3
+// Yaw -  => T2 + T4
 
 static constexpr float FX_GAIN = 1.0f;
 static constexpr float FY_GAIN = 1.0f;
 static constexpr float MZ_GAIN = 1.0f;
-
 static constexpr float THR_MAX = 1.0f;
 
-
-//assist mod full duty ------------------------------------------
+// assist mode ----------------------------------------------------
 volatile bool assistEnabled = false;
 volatile uint32_t assistEndMs = 0;
-
-volatile float assistUmax = 1.0f;     // più aggressivo dell'umax normale
+volatile float assistUmax = 1.0f;
 volatile float assistKp = 3.0f;
 volatile float assistKd = 0.25f;
 
+// ── Pitch hold (onboard, time-critical) ─────────────────────────
+volatile bool  pitchCtlEnabled = false;
+volatile float pitchRefRad     = 0.0f;
+volatile float pitchKp         = 1.2f;
+volatile float pitchKi         = 0.0f;
+volatile float pitchKd         = 0.05f;
+volatile float pitchUmax       = 0.6f;
+volatile float pitchDeadDeg    = 2.0f;   // "dritto" band
+volatile float pitchSafeDeg    = 45.0f;
+static float pitchPidI         = 0.0f;
+static float pitchPrevE        = 0.0f;
 
-// ── Pitch control ────────────────────────────────────────────────
-volatile bool pitchCtlEnabled = false;
-volatile float pitchRefRad = 0.0f;
+// ── Yaw hold (onboard, time-critical) ───────────────────────────
+volatile float yawRefRad       = 0.0f;
+volatile float yawKp           = 0.9f;
+volatile float yawKd           = 0.04f;
+volatile float yawUmax         = 0.45f;
+volatile float yawDeadDeg      = 3.0f;   // "dritto" band
+static float yawPrevE          = 0.0f;
+static float lastPitchCmd      = 0.0f;
+static float lastYawCmd        = 0.0f;
 
-volatile float Kp = 1.2f;
-volatile float Ki = 0.0f;
-volatile float Kd = 0.05f;
 
-volatile float uMax = 0.6f;
-volatile float pitchSafeDeg = 45.0f;
 
-static float pid_I = 0.0f;
-static float pid_prev_e = 0.0f;
-
+// Attitude for propeller stabilization must come from the BODY IMU.
+// In alpine_odometry_node.py the mapping is:
+//   IMU1 = rope IMU
+//   IMU2 = body IMU
+// If your physical wiring is the opposite, swap this helper accordingly.
+static inline void getAttitudeQuat(float q[4]) {
+  imu2.getQuaternion(q);   // body IMU
+}
 
 // ── Simple line reader for Serial ─────────────────────────────────────────────
 String line;
@@ -149,17 +184,22 @@ void printHelp() {
     "  THR,t1,t2,t3,t4,t5,t6    - set all thrusters duty\n"
     "  pth <val>                - manual pitch thrusters command in [-1..1]\n"
     "  pitch                    - print current pitch angle\n"
-    "  apon                     - enable auto pitch control with pitch thrusters\n"
-    "  apoff                    - disable auto pitch control\n"
-    "  apzero                   - set current pitch as reference\n"
+    "  yaw                      - print current yaw angle\n"
+    "  apon / apoff             - enable/disable onboard pitch hold\n"
+    "  ayon / ayoff             - enable/disable onboard yaw hold\n"
+    "  atton / attoff           - enable/disable both pitch+yaw hold\n"
+    "  apzero / ayzero          - set current pitch/yaw as reference\n"
+    "  attzero                  - set both references to current attitude\n"
     "  pid <Kp> <Ki> <Kd>       - set pitch controller gains\n"
+    "  ypid <Kp> <Kd>           - set yaw controller gains\n"
     "  umax <0..1>              - set max pitch thruster command\n"
+    "  yumax <0..1>             - set max yaw thruster command\n"
+    "  pdb <deg> / ydb <deg>    - set pitch/yaw deadbands in degrees\n"
     "  m<val>                   - motor command in [-1..1]\n"
     "  mf <hz>                  - set motor PWM frequency\n"
     "  mstop                    - stop motor\n"
-    "  WRC,fx,fy,mz            - set lateral wrench command\n"
-    "  pron                    - enable lateral prop control\n"
-    "  proff                   - disable lateral prop control\n"
+    "  WRC,fx,fy,mz             - set lateral wrench command (open-loop bias)\n"
+    "  pron / proff             - enable/disable lateral high-level wrench\n"
     "  ext                      - test motor extend\n"
     "  ret                      - test motor retract\n"
     "  status                   - print current state\n"
@@ -203,46 +243,67 @@ String buildDualImuCsv();
 
 // 100 Hz TX task pinned to APP CPU (keeps timing despite blocking in loop)
 void EspNowTxTask(void* arg);
+bool ensureEspNowHealthy();
 
 
 
 
 
 static inline float clampf(float x, float a, float b) { return x < a ? a : (x > b ? b : x); }
+static inline float wrapPi(float a) {
+  while (a >  3.1415926f) a -= 2.0f * 3.1415926f;
+  while (a < -3.1415926f) a += 2.0f * 3.1415926f;
+  return a;
+}
 
-// Pitch (rad) from quaternion (assume q0=w, q1=x, q2=y, q3=z)
+// Euler extraction from quaternion (assume q0=w, q1=x, q2=y, q3=z)
 static float pitchFromQuatWXYZ(float w, float x, float y, float z) {
   float sinp = 2.0f * (w*y - z*x);
   sinp = clampf(sinp, -1.0f, 1.0f);
   return asinf(sinp);
 }
 
-static float pitchPidStep(float pitchRad, float dt) {
-  float e = pitchRefRad - pitchRad;
-
-  // deadband 0.5°
-  const float dead = 0.5f * (3.1415926f / 180.0f);
-  if (fabsf(e) < dead) e = 0.0f;
-
-  float P = Kp * e;
-
-  pid_I += Ki * e * dt;
-  pid_I = clampf(pid_I, -0.5f, 0.5f);
-
-  float D = Kd * (e - pid_prev_e) / dt;
-  pid_prev_e = e;
-
-  float u = P + pid_I + D;
-
-  float u_sat = clampf(u, -uMax, uMax);
-  if (u != u_sat) pid_I *= 0.95f; // anti-windup morbido
-  return u_sat;
+static float yawFromQuatWXYZ(float w, float x, float y, float z) {
+  float siny = 2.0f * (w*z + x*y);
+  float cosy = 1.0f - 2.0f * (y*y + z*z);
+  return atan2f(siny, cosy);
 }
 
+static float pitchPidStep(float pitchRad, float dt) {
+  float e = pitchRefRad - pitchRad;
+  const float dead = pitchDeadDeg * (3.1415926f / 180.0f);
+  if (fabsf(e) < dead) e = 0.0f;
+
+  float P = pitchKp * e;
+  pitchPidI += pitchKi * e * dt;
+  pitchPidI = clampf(pitchPidI, -0.5f, 0.5f);
+  float D = pitchKd * (e - pitchPrevE) / dt;
+  pitchPrevE = e;
+
+  float u = P + pitchPidI + D;
+  float uSat = clampf(u, -pitchUmax, pitchUmax);
+  if (u != uSat) pitchPidI *= 0.95f;
+  return uSat;
+}
+
+static float yawPidStep(float yawRad, float dt) {
+  float e = wrapPi(yawRefRad - yawRad);
+  const float dead = yawDeadDeg * (3.1415926f / 180.0f);
+  if (fabsf(e) < dead) e = 0.0f;
+
+  float D = yawKd * (e - yawPrevE) / dt;
+  yawPrevE = e;
+  float u = yawKp * e + D;
+  return clampf(u, -yawUmax, yawUmax);
+}
 
 // opzionale: rampetta per non dare step bruschi agli ESC
 static float pitchTopCmd = 0.0f;
 static float pitchBotCmd = 0.0f;
+static float latCmd1 = 0.0f;
+static float latCmd2 = 0.0f;
+static float latCmd3 = 0.0f;
+static float latCmd4 = 0.0f;
 
 static inline float rampTowards(float current, float target, float step) {
   if (target > current + step) return current + step;
@@ -281,7 +342,9 @@ static inline void setLateralThrustersFromWrench(float fx, float fy, float mz) {
   float t3 = 0.0f;
   float t4 = 0.0f;
 
-  // yaw: right = T1 + T3, left = T2 + T4
+  // Yaw allocation according to agreed propeller pairs:
+  // +Mz => Y1 + Y3 => T1 + T3
+  // -Mz => Y2 + Y4 => T2 + T4
   if (mz > 0.0f) {
     t1 += MZ_GAIN * mz;
     t3 += MZ_GAIN * mz;
@@ -290,9 +353,7 @@ static inline void setLateralThrustersFromWrench(float fx, float fy, float mz) {
     t4 += MZ_GAIN * (-mz);
   }
 
-  // lateral translation:
-  // right = T2 + T3
-  // left  = T1 + T4
+  // Tangential motion on the wall (keep as config-driven bias, tune after real mounting)
   if (fy > 0.0f) {
     t2 += FY_GAIN * fy;
     t3 += FY_GAIN * fy;
@@ -301,9 +362,7 @@ static inline void setLateralThrustersFromWrench(float fx, float fy, float mz) {
     t4 += FY_GAIN * (-fy);
   }
 
-  // eventuale Fx contro il muro:
-  // scegli il pattern vero del tuo frame.
-  // Per ora esempio: stesso pattern del wall push che usavi
+  // Normal push/pull bias (placeholder until full geometry allocation is identified)
   if (fx > 0.0f) {
     t2 += FX_GAIN * fx;
     t3 += FX_GAIN * fx;
@@ -317,10 +376,15 @@ static inline void setLateralThrustersFromWrench(float fx, float fy, float mz) {
   t3 = clampf(t3, 0.0f, THR_MAX);
   t4 = clampf(t4, 0.0f, THR_MAX);
 
-  thr1.setThrottle(t1);
-  thr2.setThrottle(t2);
-  thr3.setThrottle(t3);
-  thr4.setThrottle(t4);
+  latCmd1 = rampTowards(latCmd1, t1, 0.04f);
+  latCmd2 = rampTowards(latCmd2, t2, 0.04f);
+  latCmd3 = rampTowards(latCmd3, t3, 0.04f);
+  latCmd4 = rampTowards(latCmd4, t4, 0.04f);
+
+  thr1.setThrottle(latCmd1);
+  thr2.setThrottle(latCmd2);
+  thr3.setThrottle(latCmd3);
+  thr4.setThrottle(latCmd4);
 }
 
 static inline void stopLateralThrusters() {
@@ -328,6 +392,7 @@ static inline void stopLateralThrusters() {
   thr2.stop();
   thr3.stop();
   thr4.stop();
+  latCmd1 = latCmd2 = latCmd3 = latCmd4 = 0.0f;
 }
 
 static inline void stopPitchThrusters() {
@@ -386,26 +451,26 @@ void setup() {
   uint8_t localMac[6] = {0};
   esp_read_mac(localMac, ESP_MAC_WIFI_STA);
 
-  // ⚠️ Initialize ESP-NOW and set the command callback BEFORE starting the TX task
-  bool espnow_ok = EspNow_init(DONGLE_MAC);
+  // Initialize ESP-NOW and start telemetry task even if first init fails.
+  g_espnowHealthy = EspNow_init(DONGLE_MAC);
+  g_espnowConsecutiveSendFails = 0;
+  g_espnowLastOkTxMs = 0;
+  g_espnowLastReinitMs = millis();
+
   Serial.printf(
     "[ESP-NOW] local=%02X:%02X:%02X:%02X:%02X:%02X  "
     "peer=%02X:%02X:%02X:%02X:%02X:%02X  init_ok=%s\n",
     localMac[0],localMac[1],localMac[2],localMac[3],localMac[4],localMac[5],
     DONGLE_MAC[0],DONGLE_MAC[1],DONGLE_MAC[2],DONGLE_MAC[3],DONGLE_MAC[4],DONGLE_MAC[5],
-    espnow_ok ? "true" : "false"
+    g_espnowHealthy ? "true" : "false"
   );
 
-  if (espnow_ok) {
-    EspNow_setCommandCallback(handleCommandLine);
+  EspNow_setCommandCallback(handleCommandLine);
 
-    // Launch 100 Hz telemetry TX task ONLY if init succeeded
-    BaseType_t ok = xTaskCreatePinnedToCore(
-        EspNowTxTask, "espnow_tx", 4096, nullptr, 2, nullptr, APP_CPU_NUM);
-    if (ok != pdPASS) Serial.println("[ESP-NOW] ERROR: TX task create failed!");
-  } else {
-    Serial.println("[ESP-NOW] init failed — TX task not started.");
-  }
+  // Always launch telemetry TX task; it will self-heal/reinit if ESP-NOW is down.
+  BaseType_t ok = xTaskCreatePinnedToCore(
+      EspNowTxTask, "espnow_tx", 4096, nullptr, 2, nullptr, APP_CPU_NUM);
+  if (ok != pdPASS) Serial.println("[ESP-NOW] ERROR: TX task create failed!");
 
   Serial.println("Ready.");
   printHelp();
@@ -425,13 +490,16 @@ void loop() {
   // Pump ESP-NOW RX queue → dispatches to handleCommandLine()
   EspNow_loop();
 
-// Safety timeout for thrusters
+// Safety timeout for externally requested propeller commands.
+// Onboard pitch/yaw hold remain allowed to run autonomously.
 if (millis() - lastThrCmdMs > THR_TIMEOUT_MS) {
   cmdFx = 0.0f;
   cmdFy = 0.0f;
   cmdMz = 0.0f;
-  stopLateralThrusters();
 
+  if (!yawCtlEnabled && !propCtrlEnabled) {
+    stopLateralThrusters();
+  }
   if (!pitchCtlEnabled) {
     stopPitchThrusters();
   }
@@ -557,15 +625,22 @@ void handleCommandLine(const String& in) {
 
   } else if (low == "pitch") {
     float q[4];
-    imu1.getQuaternion(q);
+    getAttitudeQuat(q);
     float pitchRad = pitchFromQuatWXYZ(q[0], q[1], q[2], q[3]);
     float pitchDeg = pitchRad * 180.0f / 3.1415926f;
     Serial.printf("Pitch = %.2f deg\n", pitchDeg);
 
+  } else if (low == "yaw") {
+    float q[4];
+    getAttitudeQuat(q);
+    float yawRad = yawFromQuatWXYZ(q[0], q[1], q[2], q[3]);
+    float yawDeg = yawRad * 180.0f / 3.1415926f;
+    Serial.printf("Yaw = %.2f deg\n", yawDeg);
+
   } else if (low == "apon") {
     pitchCtlEnabled = true;
-    pid_I = 0.0f;
-    pid_prev_e = 0.0f;
+    pitchPidI = 0.0f;
+    pitchPrevE = 0.0f;
     Serial.println("AutoPitch ON (pitch thrusters)");
 
   } else if (low == "apoff") {
@@ -574,6 +649,31 @@ void handleCommandLine(const String& in) {
   stopPitchThrusters();
   motor.stop();
   Serial.println("AutoPitch OFF");
+
+  } else if (low == "ayon") {
+    yawCtlEnabled = true;
+    yawPrevE = 0.0f;
+    Serial.println("AutoYaw ON (lateral thrusters)");
+
+  } else if (low == "ayoff") {
+    yawCtlEnabled = false;
+    if (!propCtrlEnabled) stopLateralThrusters();
+    Serial.println("AutoYaw OFF");
+
+  } else if (low == "atton") {
+    pitchCtlEnabled = true;
+    yawCtlEnabled = true;
+    pitchPidI = 0.0f;
+    pitchPrevE = 0.0f;
+    yawPrevE = 0.0f;
+    Serial.println("Attitude hold ON (pitch + yaw)");
+
+  } else if (low == "attoff") {
+    pitchCtlEnabled = false;
+    yawCtlEnabled = false;
+    assistEnabled = false;
+    stopAllThrusters();
+    Serial.println("Attitude hold OFF");
 
   } else if (low == "pron") {
   propCtrlEnabled = true;
@@ -587,20 +687,37 @@ void handleCommandLine(const String& in) {
   Serial.println("Lateral prop control OFF");
   }else if (low == "apzero") {
     float q[4];
-    imu1.getQuaternion(q);
+    getAttitudeQuat(q);
     pitchRefRad = pitchFromQuatWXYZ(q[0], q[1], q[2], q[3]);
-    pid_I = 0.0f;
-    pid_prev_e = 0.0f;
+    pitchPidI = 0.0f;
+    pitchPrevE = 0.0f;
     Serial.println("AutoPitch reference set (apzero)");
+
+  } else if (low == "ayzero") {
+    float q[4];
+    getAttitudeQuat(q);
+    yawRefRad = yawFromQuatWXYZ(q[0], q[1], q[2], q[3]);
+    yawPrevE = 0.0f;
+    Serial.println("AutoYaw reference set (ayzero)");
+
+  } else if (low == "attzero") {
+    float q[4];
+    getAttitudeQuat(q);
+    pitchRefRad = pitchFromQuatWXYZ(q[0], q[1], q[2], q[3]);
+    yawRefRad = yawFromQuatWXYZ(q[0], q[1], q[2], q[3]);
+    pitchPidI = 0.0f;
+    pitchPrevE = 0.0f;
+    yawPrevE = 0.0f;
+    Serial.println("Pitch+Yaw references set from current attitude");
 
   } else if (low.startsWith("pid ")) {
     float p, i, d;
     int n = sscanf(cmd.c_str(), "pid %f %f %f", &p, &i, &d);
     if (n == 3) {
-      Kp = p;
-      Ki = i;
-      Kd = d;
-      Serial.printf("PID set: Kp=%.3f Ki=%.3f Kd=%.3f\n", Kp, Ki, Kd);
+      pitchKp = p;
+      pitchKi = i;
+      pitchKd = d;
+      Serial.printf("PID set: Kp=%.3f Ki=%.3f Kd=%.3f\n", pitchKp, pitchKi, pitchKd);
     } else {
       Serial.println("Usage: pid <Kp> <Ki> <Kd>");
     }
@@ -609,10 +726,51 @@ void handleCommandLine(const String& in) {
     float x;
     int n = sscanf(cmd.c_str(), "umax %f", &x);
     if (n == 1) {
-      uMax = clampf(x, 0.0f, 1.0f);
-      Serial.printf("uMax=%.2f\n", uMax);
+      pitchUmax = clampf(x, 0.0f, 1.0f);
+      Serial.printf("Pitch uMax=%.2f\n", pitchUmax);
     } else {
       Serial.println("Usage: umax <0..1>");
+    }
+
+  } else if (low.startsWith("ypid ")) {
+    float p, d;
+    int n = sscanf(cmd.c_str(), "ypid %f %f", &p, &d);
+    if (n == 2) {
+      yawKp = p;
+      yawKd = d;
+      Serial.printf("Yaw PID set: Kp=%.3f Kd=%.3f\n", yawKp, yawKd);
+    } else {
+      Serial.println("Usage: ypid <Kp> <Kd>");
+    }
+
+  } else if (low.startsWith("yumax ")) {
+    float x;
+    int n = sscanf(cmd.c_str(), "yumax %f", &x);
+    if (n == 1) {
+      yawUmax = clampf(x, 0.0f, 1.0f);
+      Serial.printf("Yaw uMax=%.2f\n", yawUmax);
+    } else {
+      Serial.println("Usage: yumax <0..1>");
+    }
+
+  } else if (low.startsWith("pdb ")) {
+    float x;
+    int n = sscanf(cmd.c_str(), "pdb %f", &x);
+    if (n == 1) {
+      pitchDeadDeg = clampf(x, 0.0f, 30.0f);
+      Serial.printf("Pitch deadband=%.2f deg\n", pitchDeadDeg);
+    } else {
+      Serial.println("Usage: pdb <deg>");
+    }
+
+  } else if (low.startsWith("ydb ")) {
+    float x;
+    int n = sscanf(cmd.c_str(), "ydb %f", &x);
+    if (n == 1) {
+      yawDeadDeg = clampf(x, 0.0f, 45.0f);
+      Serial.printf("Yaw deadband=%.2f deg\n", yawDeadDeg);
+    } else {
+      Serial.println("Usage: ydb <deg>");
     }
 
   } else if (low.startsWith("assist ")) {
@@ -623,8 +781,8 @@ void handleCommandLine(const String& in) {
       if (ms > 2000) ms = 2000;
       assistEnabled = true;
       assistEndMs = millis() + (uint32_t)ms;
-      pid_I = 0.0f;
-      pid_prev_e = 0.0f;
+      pitchPidI = 0.0f;
+      pitchPrevE = 0.0f;
       Serial.printf("Assist ON for %d ms\n", ms);
     } else {
       Serial.println("Usage: assist <ms 50..2000>");
@@ -650,6 +808,11 @@ void handleCommandLine(const String& in) {
   Serial.println("--- STATUS ---");
   Serial.printf("Motor duty cmd: %.3f\n", motor.lastCommand());
   Serial.printf("cmdFx=%.2f cmdFy=%.2f cmdMz=%.2f\n", cmdFx, cmdFy, cmdMz);
+  Serial.printf("pitchCtl=%d yawCtl=%d propCtrl=%d pitchRef=%.2fdeg yawRef=%.2fdeg pDead=%.2f yDead=%.2f\n",
+                (int)pitchCtlEnabled, (int)yawCtlEnabled, (int)propCtrlEnabled,
+                pitchRefRad * 180.0f / 3.1415926f, yawRefRad * 180.0f / 3.1415926f,
+                pitchDeadDeg, yawDeadDeg);
+  Serial.printf("lastPitchCmd=%.2f lastYawCmd=%.2f\n", lastPitchCmd, lastYawCmd);
   Serial.printf("T1=%.2f T2=%.2f T3=%.2f T4=%.2f T5=%.2f T6=%.2f\n",
     thr1.lastThrottle(), thr2.lastThrottle(), thr3.lastThrottle(),
     thr4.lastThrottle(), thr5.lastThrottle(), thr6.lastThrottle());
@@ -664,6 +827,34 @@ void handleCommandLine(const String& in) {
 }
 
 // ── Build dual-IMU CSV line ───────────────────────────────────────────────────
+bool ensureEspNowHealthy() {
+  const uint32_t now = millis();
+
+  const bool stale = (g_espnowLastOkTxMs > 0) && ((now - g_espnowLastOkTxMs) > ESPNOW_STALE_MS);
+  const bool tooManyFails = (g_espnowConsecutiveSendFails >= ESPNOW_FAIL_THRESHOLD);
+
+  if (g_espnowHealthy && !stale && !tooManyFails) return true;
+  if ((now - g_espnowLastReinitMs) < ESPNOW_REINIT_COOLDOWN_MS) return g_espnowHealthy;
+
+  g_espnowLastReinitMs = now;
+  Serial.printf("[ESP-NOW] reinit requested (healthy=%s stale=%s fails=%lu)\n",
+                g_espnowHealthy ? "true" : "false",
+                stale ? "true" : "false",
+                (unsigned long)g_espnowConsecutiveSendFails);
+
+  g_espnowHealthy = EspNow_init(DONGLE_MAC);
+  EspNow_setCommandCallback(handleCommandLine);
+
+  if (g_espnowHealthy) {
+    g_espnowConsecutiveSendFails = 0;
+    Serial.println("[ESP-NOW] reinit OK");
+  } else {
+    Serial.println("[ESP-NOW] reinit FAILED");
+  }
+
+  return g_espnowHealthy;
+}
+
 String buildDualImuCsv() {
   // Update both IMUs; collect their CSV into strings without trailing newline.
   imu1.update();
@@ -702,38 +893,51 @@ void EspNowTxTask(void* arg) {
     // Optional: echo to USB for debug
     // Serial.print(csv);
 
-   // pitch control (pitch thrusters)
- bool assistActive = assistEnabled && ((int32_t)(millis() - assistEndMs) < 0);
-if (assistEnabled && !assistActive) assistEnabled = false;
+   // Onboard attitude stabilization should live here (time-critical),
+   // while high-level ROS only sends bias wrench commands.
+   float q[4];
+   getAttitudeQuat(q);
+   const float pitchRad = pitchFromQuatWXYZ(q[0], q[1], q[2], q[3]);
+   const float yawRad   = yawFromQuatWXYZ(q[0], q[1], q[2], q[3]);
+   const float pitchDeg = pitchRad * 180.0f / 3.1415926f;
 
-if (pitchCtlEnabled || assistActive) {
-  float q[4];
-  imu1.getQuaternion(q);
-  float pitchRad = pitchFromQuatWXYZ(q[0], q[1], q[2], q[3]);
-  float pitchDeg = pitchRad * 180.0f / 3.1415926f;
+   bool assistActive = assistEnabled && ((int32_t)(millis() - assistEndMs) < 0);
+   if (assistEnabled && !assistActive) assistEnabled = false;
 
-  if (fabsf(pitchDeg) > pitchSafeDeg) {
-    stopPitchThrusters();
-  } else {
-    float kp = assistActive ? assistKp : Kp;
-    float kd = assistActive ? assistKd : Kd;
-    float umax = assistActive ? assistUmax : uMax;
+   // Pitch hold on dedicated pair T5/T6
+   if (pitchCtlEnabled || assistActive) {
+     if (fabsf(pitchDeg) > pitchSafeDeg) {
+       lastPitchCmd = 0.0f;
+       stopPitchThrusters();
+     } else if (assistActive) {
+       const float e = pitchRefRad - pitchRad;
+       const float D = assistKd * (e - pitchPrevE) / dt;
+       pitchPrevE = e;
+       lastPitchCmd = clampf(assistKp * e + D, -assistUmax, assistUmax);
+       setPitchThrusters(lastPitchCmd);
+     } else {
+       lastPitchCmd = pitchPidStep(pitchRad, dt);
+       setPitchThrusters(lastPitchCmd);
+     }
+   } else {
+     lastPitchCmd = 0.0f;
+     stopPitchThrusters();
+   }
 
-    float e = pitchRefRad - pitchRad;
-    float D = kd * (e - pid_prev_e) / 0.01f;
-    pid_prev_e = e;
+   // Yaw hold runs on the four lateral thrusters and adds to the high-level open-loop cmdMz.
+   float yawHoldMz = 0.0f;
+   if (yawCtlEnabled) {
+     yawHoldMz = yawPidStep(yawRad, dt);
+   }
+   lastYawCmd = yawHoldMz;
 
-    float u = kp * e + D;
-    u = clampf(u, -umax, umax);
+   const bool lateralActive = propCtrlEnabled || yawCtlEnabled;
+   if (lateralActive) {
+     setLateralThrustersFromWrench(cmdFx, cmdFy, cmdMz + yawHoldMz);
+   } else {
+     stopLateralThrusters();
+   }
 
-    setPitchThrusters(u);
-  }
-} else {
-  stopPitchThrusters();
-}
-if (propCtrlEnabled) {
-  setLateralThrustersFromWrench(cmdFx, cmdFy, cmdMz);
-}
     // Send over ESP-NOW (silently ignore if not initialized)
     EspNow_send(csv);
   }
