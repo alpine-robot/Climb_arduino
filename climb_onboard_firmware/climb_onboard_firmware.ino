@@ -106,7 +106,7 @@ volatile float cmdFx = 0.0f;   // body-frame force x request from high level
 volatile float cmdFy = 0.0f;   // body-frame force y request from high level
 volatile float cmdMz = 0.0f;   // open-loop yaw moment request from high level
 
-volatile bool propCtrlEnabled = true;   // lateral wrench from ROS/ESP-NOW enabled
+volatile bool propCtrlEnabled = false;  // lateral wrench from ROS/ESP-NOW enabled
 volatile bool yawCtlEnabled   = false;  // IMU-based yaw hold enabled
 
 // Final thruster configuration (already agreed with wiring):
@@ -203,6 +203,7 @@ void printHelp() {
     "  ext                      - test motor extend\n"
     "  ret                      - test motor retract\n"
     "  status                   - print current state\n"
+    "  arm / disarm            - send min throttle / stop all ESCs\n"
     "  help                     - show this help\n"
   ));
 }
@@ -407,6 +408,14 @@ static inline void stopAllThrusters() {
   stopPitchThrusters();
 }
 
+static inline void armAllThrusters(uint32_t armMs = 3000, uint32_t periodMs = 20) {
+  const uint32_t t0 = millis();
+  while ((millis() - t0) < armMs) {
+    stopAllThrusters();
+    delay(periodMs);
+  }
+}
+
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
@@ -426,9 +435,12 @@ void setup() {
   thr5.begin();
   thr6.begin();
 
-   // arm ESC a zero
-  stopAllThrusters();
-  delay(3000);
+  // Robust ESC arming: send min-throttle for a few seconds at 50 Hz.
+  // This avoids the periodic beep / micro-movement state typical of "not armed" ESCs.
+  Serial.println("Arming ESCs at minimum throttle...");
+  armAllThrusters(3000, 20);
+  lastThrCmdMs = millis();
+  Serial.println("ESCs armed.");
 
   ServoValve1.setAngle(0);
   ServoValve2.setAngle(0);
@@ -548,7 +560,14 @@ void handleCommandLine(const String& in) {
     }
 
     if (matched == 6) {
+  // Enter full manual thruster mode for bench testing.
   propCtrlEnabled = false;
+  yawCtlEnabled = false;
+  pitchCtlEnabled = false;
+  assistEnabled = false;
+  cmdFx = 0.0f;
+  cmdFy = 0.0f;
+  cmdMz = 0.0f;
 
   thr1.setThrottle(t1);
   thr2.setThrottle(t2);
@@ -572,6 +591,9 @@ void handleCommandLine(const String& in) {
   if (n == 1) {
     pitchCtlEnabled = false;
     assistEnabled = false;
+    cmdFx = 0.0f;
+    cmdFy = 0.0f;
+    cmdMz = 0.0f;
     setPitchThrusters(u);
     lastThrCmdMs = millis();
     Serial.printf("Pitch thrusters -> %.2f\n", u);
@@ -818,7 +840,25 @@ void handleCommandLine(const String& in) {
     thr4.lastThrottle(), thr5.lastThrottle(), thr6.lastThrottle());
     
   Serial.printf("ESP-NOW tx_count: %lu\n", (unsigned long)EspNow_txCount());
-} else if (low == "help" || low == "?") {
+
+  } else if (low == "arm") {
+    Serial.println("Arming ESCs...");
+    armAllThrusters(3000, 20);
+    lastThrCmdMs = millis();
+    Serial.println("ESCs armed.");
+
+  } else if (low == "disarm") {
+    pitchCtlEnabled = false;
+    yawCtlEnabled = false;
+    propCtrlEnabled = false;
+    assistEnabled = false;
+    cmdFx = 0.0f;
+    cmdFy = 0.0f;
+    cmdMz = 0.0f;
+    stopAllThrusters();
+    Serial.println("ESCs forced to minimum throttle.");
+
+  } else if (low == "help" || low == "?") {
     printHelp();
 
   } else if (low.length() > 0) {
