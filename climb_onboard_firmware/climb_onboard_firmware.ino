@@ -42,13 +42,19 @@ Serial Commands
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <ESP32Servo.h>
 #include "ServoValve.h"
 #include "Motor.h"
-#include "EscThruster.h"
 #include "Movella.h"
 #include "EspNow.h"
 #include <esp_mac.h>  // at top, with other includes
+
+#if __has_include(<esp_arduino_version.h>)
+  #include <esp_arduino_version.h>
+#endif
+
+#ifndef ESP_ARDUINO_VERSION_MAJOR
+  #define ESP_ARDUINO_VERSION_MAJOR 2
+#endif
 
 // ── Peer (of dongle) MAC address — CHANGE THIS ───────────────────────────────────
 uint8_t DONGLE_MAC[6] = { 0x50, 0x78, 0x7D, 0x16, 0xA9, 0x0C };
@@ -59,28 +65,153 @@ static constexpr uint8_t SERVO2_PIN = 36;
 static constexpr uint8_t RPWM_PIN   = 37;   // BTS7960 RPWM
 static constexpr uint8_t LPWM_PIN   = 38;   // BTS7960 LPWM
 
-static constexpr uint8_t PIN_T1 = 6;
-static constexpr uint8_t PIN_T2 = 7;
-static constexpr uint8_t PIN_T3 = 8;
-static constexpr uint8_t PIN_T4 = 9;
+// Thruster pins: questi sono quelli verificati nel tester LEDC su ESP32-S3.
+static constexpr uint8_t PIN_T1 = 12;
+static constexpr uint8_t PIN_T2 = 13;
+static constexpr uint8_t PIN_T3 = 14;
+static constexpr uint8_t PIN_T4 = 15;
+static constexpr uint8_t PIN_T5 = 39;   // top pitch thruster
+static constexpr uint8_t PIN_T6 = 21;   // bottom pitch thruster
 
-static constexpr uint8_t PIN_T5 = 10;   // top pitch thruster
-static constexpr uint8_t PIN_T6 = 11;   // bottom pitch thruster
+// LEDC channels: devono essere espliciti e unici, altrimenti i PWM si copiano tra pin.
+static constexpr uint8_t CH_T1 = 0;
+static constexpr uint8_t CH_T2 = 1;
+static constexpr uint8_t CH_T3 = 2;
+static constexpr uint8_t CH_T4 = 3;
+static constexpr uint8_t CH_T5 = 4;
+static constexpr uint8_t CH_T6 = 5;
+
+// ESC pulse values
+static constexpr int ESC_MIN_US  = 1000;
+static constexpr int ESC_MAX_US  = 2000;
+static constexpr int ESC_STOP_US = 1000;
+
+// PWM settings for ESCs
+static constexpr uint32_t ESC_PWM_FREQ_HZ   = 50;
+static constexpr uint8_t  ESC_PWM_RES_BITS  = 14;
+static constexpr uint32_t ESC_PWM_PERIOD_US = 1000000UL / ESC_PWM_FREQ_HZ;
+
+static inline uint32_t escUsToDuty(int us) {
+  if (us < 0) us = 0;
+  if (us > (int)ESC_PWM_PERIOD_US) us = ESC_PWM_PERIOD_US;
+
+  const uint32_t maxDuty = (1UL << ESC_PWM_RES_BITS) - 1;
+  return (uint32_t)(((uint64_t)us * maxDuty + ESC_PWM_PERIOD_US / 2) / ESC_PWM_PERIOD_US);
+}
+
+static inline bool escAttachPwm(uint8_t pin, uint8_t channel) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  return ledcAttachChannel(pin, ESC_PWM_FREQ_HZ, ESC_PWM_RES_BITS, channel);
+#else
+  ledcSetup(channel, ESC_PWM_FREQ_HZ, ESC_PWM_RES_BITS);
+  ledcAttachPin(pin, channel);
+  return true;
+#endif
+}
+
+static inline bool escWritePwm(uint8_t channel, uint32_t duty) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  return ledcWriteChannel(channel, duty);
+#else
+  ledcWrite(channel, duty);
+  return true;
+#endif
+}
+
+// Sostituisce il vecchio EscThruster basato su ESP32Servo.
+// Nome diverso per evitare conflitti se EscThruster.h/.cpp restano nella cartella del progetto.
+// Mantiene la stessa API usata dal resto del programma: begin(), setThrottle(), stop(), lastThrottle().
+class LedcThruster {
+public:
+  LedcThruster(uint8_t pin,
+              uint8_t channel,
+              int min_us = ESC_MIN_US,
+              int max_us = ESC_MAX_US,
+              int stop_us = ESC_STOP_US)
+  : pin_(pin),
+    channel_(channel),
+    minUs_(min_us),
+    maxUs_(max_us),
+    stopUs_(stop_us),
+    currentUs_(stop_us),
+    throttle_(0.0f),
+    attached_(false) {}
+
+  bool begin() {
+    pinMode(pin_, OUTPUT);
+    attached_ = escAttachPwm(pin_, channel_);
+    stop();
+    return attached_;
+  }
+
+  void setThrottle(float x) {
+    if (x < 0.0f) x = 0.0f;
+    if (x > 1.0f) x = 1.0f;
+
+    throttle_ = x;
+    const int us = minUs_ + static_cast<int>((maxUs_ - minUs_) * throttle_);
+    writeUs(us);
+  }
+
+  void stop() {
+    throttle_ = 0.0f;
+    writeUs(stopUs_);
+  }
+
+  void refresh() {
+    writeUs(currentUs_);
+  }
+
+  void arm(uint32_t arm_ms = 3000, uint32_t period_ms = 20) {
+    const uint32_t t0 = millis();
+    while ((millis() - t0) < arm_ms) {
+      stop();
+      delay(period_ms);
+    }
+  }
+
+  float lastThrottle() const { return throttle_; }
+  int lastPulseUs() const { return currentUs_; }
+  uint8_t pin() const { return pin_; }
+  uint8_t channel() const { return channel_; }
+  bool attached() const { return attached_; }
+
+private:
+  void writeUs(int us) {
+    currentUs_ = us;
+    const uint32_t duty = escUsToDuty(currentUs_);
+    const bool ok = escWritePwm(channel_, duty);
+    if (!ok) {
+      Serial.print("ERROR ledcWrite on thruster pin=");
+      Serial.print(pin_);
+      Serial.print(" ch=");
+      Serial.println(channel_);
+    }
+  }
+
+  uint8_t pin_;
+  uint8_t channel_;
+  int minUs_;
+  int maxUs_;
+  int stopUs_;
+  int currentUs_;
+  float throttle_;
+  bool attached_;
+};
 
 // ── Objects ───────────────────────────────────────────────────────────────────
 ServoValve ServoValve1(SERVO1_PIN);
 ServoValve ServoValve2(SERVO2_PIN);
 
-EscThruster  thr1(PIN_T1);
-EscThruster  thr2(PIN_T2);
-EscThruster  thr3(PIN_T3);
-EscThruster  thr4(PIN_T4);
-
-EscThruster  thr5(PIN_T5);   // upper pitch
-EscThruster  thr6(PIN_T6);   // lower pitch
+LedcThruster thr1(PIN_T1, CH_T1);
+LedcThruster thr2(PIN_T2, CH_T2);
+LedcThruster thr3(PIN_T3, CH_T3);
+LedcThruster thr4(PIN_T4, CH_T4);
+LedcThruster thr5(PIN_T5, CH_T5);   // upper pitch
+LedcThruster thr6(PIN_T6, CH_T6);   // lower pitch
 
 // Software-PWM Motor (keep low-moderate due to blocking servo frames)
-Motor motor(RPWM_PIN, LPWM_PIN, /*pwmHz*/1000);
+Motor motor(RPWM_PIN, LPWM_PIN, 1000);
 
 // Movella IMUs on two UARTs
 HardwareSerial Xsens1(2);  // UART2: RX=16, TX=17
@@ -90,7 +221,9 @@ Movella imu2(Xsens2, 2);
 
 // ── Thruster timeout ─────────────────
 volatile uint32_t lastThrCmdMs = 0;
-static constexpr uint32_t THR_TIMEOUT_MS = 500; //300
+static constexpr uint32_t THR_TIMEOUT_MS = 500;         // external cyclic commands, e.g. WRC / ROS / ESP-NOW
+static constexpr uint32_t MANUAL_THR_TIMEOUT_MS = 5000; // bench commands from Serial: t1..t6, THR, pth
+static constexpr uint32_t SERIAL_IDLE_COMMAND_MS = 80;  // accepts Serial Monitor set to "No line ending"
 
 // ── ESP-NOW telemetry health / auto-recovery ─────────────────
 volatile bool g_espnowHealthy = false;
@@ -108,6 +241,7 @@ volatile float cmdMz = 0.0f;   // open-loop yaw moment request from high level
 
 volatile bool propCtrlEnabled = false;  // lateral wrench from ROS/ESP-NOW enabled
 volatile bool yawCtlEnabled   = false;  // IMU-based yaw hold enabled
+volatile bool manualThrusterMode = false; // true for THR / tN / pth bench commands until timeout
 
 // Final thruster configuration (already agreed with wiring):
 // T1 = Y1 = CW   , Pack A
@@ -164,15 +298,38 @@ static inline void getAttitudeQuat(float q[4]) {
   imu2.getQuaternion(q);   // body IMU
 }
 
-// ── Simple line reader for Serial ─────────────────────────────────────────────
+// ── Robust line reader for Serial ─────────────────────────────────────────────
+// Works with Arduino Serial Monitor set to Newline, Both NL & CR, or No line ending.
 String line;
+static uint32_t lastSerialCharMs = 0;
+static constexpr size_t SERIAL_MAX_LINE_LEN = 180;
+
 bool readLine(String& out) {
   while (Serial.available()) {
     char c = (char)Serial.read();
-    if (c == '\r') continue;
-    if (c == '\n') { out.trim(); return true; }
+    lastSerialCharMs = millis();
+
+    if (c == '\r' || c == '\n') {
+      out.trim();
+      return out.length() > 0;
+    }
+
     out += c;
+
+    if (out.length() > SERIAL_MAX_LINE_LEN) {
+      out = "";
+      Serial.println("ERR: serial command too long, buffer cleared.");
+      return false;
+    }
   }
+
+  // Same behaviour as the low-level tester: command is accepted after a short idle time
+  // even if no newline is sent.
+  if (out.length() > 0 && (millis() - lastSerialCharMs) >= SERIAL_IDLE_COMMAND_MS) {
+    out.trim();
+    return out.length() > 0;
+  }
+
   return false;
 }
 
@@ -182,6 +339,7 @@ void printHelp() {
     "  s1 <deg>                 - set valve1 angle (0..90)\n"
     "  s2 <deg>                 - set valve2 angle (0..90)\n"
     "  THR,t1,t2,t3,t4,t5,t6    - set all thrusters duty\n"
+    "  t1 <val> ... t6 <val>    - set one thruster duty without changing the others\n"
     "  pth <val>                - manual pitch thrusters command in [-1..1]\n"
     "  pitch                    - print current pitch angle\n"
     "  yaw                      - print current yaw angle\n"
@@ -203,7 +361,8 @@ void printHelp() {
     "  ext                      - test motor extend\n"
     "  ret                      - test motor retract\n"
     "  status                   - print current state\n"
-    "  arm / disarm            - send min throttle / stop all ESCs\n"
+    "  arm / disarm             - send min throttle / stop all ESCs\n"
+    "  stop                     - stop all thrusters\n"
     "  help                     - show this help\n"
   ));
 }
@@ -310,6 +469,68 @@ static inline float rampTowards(float current, float target, float step) {
   if (target > current + step) return current + step;
   if (target < current - step) return current - step;
   return target;
+}
+
+static inline bool isManualThrusterActive(uint32_t now = millis()) {
+  return manualThrusterMode && ((now - lastThrCmdMs) <= MANUAL_THR_TIMEOUT_MS);
+}
+
+static inline void enterManualThrusterMode() {
+  manualThrusterMode = true;
+  propCtrlEnabled = false;
+  yawCtlEnabled = false;
+  pitchCtlEnabled = false;
+  assistEnabled = false;
+  cmdFx = 0.0f;
+  cmdFy = 0.0f;
+  cmdMz = 0.0f;
+  lastThrCmdMs = millis();
+}
+
+static inline void setPitchThrustersDirect(float pitchCmd) {
+  pitchCmd = clampf(pitchCmd, -1.0f, 1.0f);
+
+  float t5 = 0.0f;
+  float t6 = 0.0f;
+
+  if (pitchCmd > 0.0f) {
+    t5 = pitchCmd;
+  } else if (pitchCmd < 0.0f) {
+    t6 = -pitchCmd;
+  }
+
+  pitchTopCmd = t5;
+  pitchBotCmd = t6;
+
+  thr5.setThrottle(t5);
+  thr6.setThrottle(t6);
+}
+
+static inline bool setSingleThrusterManual(uint8_t number, float throttle) {
+  throttle = clampf(throttle, 0.0f, 1.0f);
+
+  switch (number) {
+    case 1: latCmd1 = throttle; thr1.setThrottle(throttle); break;
+    case 2: latCmd2 = throttle; thr2.setThrottle(throttle); break;
+    case 3: latCmd3 = throttle; thr3.setThrottle(throttle); break;
+    case 4: latCmd4 = throttle; thr4.setThrottle(throttle); break;
+    case 5: thr5.setThrottle(throttle); pitchTopCmd = throttle; break;
+    case 6: thr6.setThrottle(throttle); pitchBotCmd = throttle; break;
+    default: return false;
+  }
+
+  return true;
+}
+
+static inline void printThrusterAttachStatus(const char* name, uint8_t pin, uint8_t channel, bool attached) {
+  Serial.print("Attach ");
+  Serial.print(name);
+  Serial.print(" pin=");
+  Serial.print(pin);
+  Serial.print(" ch=");
+  Serial.print(channel);
+  Serial.print(" -> ");
+  Serial.println(attached ? "OK" : "FAIL");
 }
 
 
@@ -428,12 +649,12 @@ void setup() {
   ServoValve1.begin();
   ServoValve2.begin();
   
-  thr1.begin();
-  thr2.begin();
-  thr3.begin();
-  thr4.begin();
-  thr5.begin();
-  thr6.begin();
+  thr1.begin(); printThrusterAttachStatus("T1", PIN_T1, CH_T1, thr1.attached());
+  thr2.begin(); printThrusterAttachStatus("T2", PIN_T2, CH_T2, thr2.attached());
+  thr3.begin(); printThrusterAttachStatus("T3", PIN_T3, CH_T3, thr3.attached());
+  thr4.begin(); printThrusterAttachStatus("T4", PIN_T4, CH_T4, thr4.attached());
+  thr5.begin(); printThrusterAttachStatus("T5", PIN_T5, CH_T5, thr5.attached());
+  thr6.begin(); printThrusterAttachStatus("T6", PIN_T6, CH_T6, thr6.attached());
 
   // Robust ESC arming: send min-throttle for a few seconds at 50 Hz.
   // This avoids the periodic beep / micro-movement state typical of "not armed" ESCs.
@@ -481,7 +702,7 @@ void setup() {
 
   // Always launch telemetry TX task; it will self-heal/reinit if ESP-NOW is down.
   BaseType_t ok = xTaskCreatePinnedToCore(
-      EspNowTxTask, "espnow_tx", 4096, nullptr, 2, nullptr, APP_CPU_NUM);
+      EspNowTxTask, "espnow_tx", 4096, nullptr, 1, nullptr, APP_CPU_NUM);
   if (ok != pdPASS) Serial.println("[ESP-NOW] ERROR: TX task create failed!");
 
   Serial.println("Ready.");
@@ -491,31 +712,46 @@ void setup() {
 // ── Loop ──────────────────────────────────────────────────────────────────────
 void loop() {
   // Parse Serial commands
+  //Serial.println("hello!");
   if (readLine(line)) {
-    String cmd = line; 
+    String cmd = line;
     cmd.trim();
-    handleCommandLine(cmd);  // shared parser
     line = "";
+
+    if (cmd.length() > 0) {
+      Serial.print("RX: ");
+      Serial.println(cmd);
+      handleCommandLine(cmd);  // shared parser
+    }
+
     Serial.print("> ");
   }
 
   // Pump ESP-NOW RX queue → dispatches to handleCommandLine()
   EspNow_loop();
 
-// Safety timeout for externally requested propeller commands.
-// Onboard pitch/yaw hold remain allowed to run autonomously.
-if (millis() - lastThrCmdMs > THR_TIMEOUT_MS) {
-  cmdFx = 0.0f;
-  cmdFy = 0.0f;
-  cmdMz = 0.0f;
+  // Safety timeout for externally requested propeller commands.
+  // Manual bench commands use a longer timeout so they do not disappear immediately.
+  const uint32_t now = millis();
+  const bool manualActive = isManualThrusterActive(now);
 
-  if (!yawCtlEnabled && !propCtrlEnabled) {
-    stopLateralThrusters();
+  if (manualThrusterMode && !manualActive) {
+    manualThrusterMode = false;
+    stopAllThrusters();
   }
-  if (!pitchCtlEnabled) {
-    stopPitchThrusters();
+
+  if (!manualActive && (now - lastThrCmdMs > THR_TIMEOUT_MS)) {
+    cmdFx = 0.0f;
+    cmdFy = 0.0f;
+    cmdMz = 0.0f;
+
+    if (!yawCtlEnabled && !propCtrlEnabled) {
+      stopLateralThrusters();
+    }
+    if (!pitchCtlEnabled) {
+      stopPitchThrusters();
+    }
   }
-}
 
   // Run software PWM for motor as often as possible
   motor.update();
@@ -542,7 +778,10 @@ void handleCommandLine(const String& in) {
   String low = cmd;
   low.toLowerCase();
 
-  if (low.startsWith("s1")) {
+  if (low == "ping") {
+    Serial.println("pong");
+
+  } else if (low.startsWith("s1")) {
     float v = cmd.substring(2).toFloat();
     ServoValve1.setAngle(v);
     Serial.printf("Valve1 -> %.1f deg\n", v);
@@ -560,43 +799,72 @@ void handleCommandLine(const String& in) {
     }
 
     if (matched == 6) {
-  // Enter full manual thruster mode for bench testing.
-  propCtrlEnabled = false;
-  yawCtlEnabled = false;
-  pitchCtlEnabled = false;
-  assistEnabled = false;
-  cmdFx = 0.0f;
-  cmdFy = 0.0f;
-  cmdMz = 0.0f;
+      // Full manual thruster mode for bench testing.
+      // The 100 Hz task will not overwrite these outputs until THR_TIMEOUT_MS expires.
+      enterManualThrusterMode();
 
-  thr1.setThrottle(t1);
-  thr2.setThrottle(t2);
-  thr3.setThrottle(t3);
-  thr4.setThrottle(t4);
+      t1 = clampf(t1, 0.0f, 1.0f);
+      t2 = clampf(t2, 0.0f, 1.0f);
+      t3 = clampf(t3, 0.0f, 1.0f);
+      t4 = clampf(t4, 0.0f, 1.0f);
+      t5 = clampf(t5, 0.0f, 1.0f);
+      t6 = clampf(t6, 0.0f, 1.0f);
 
-  if (!pitchCtlEnabled) {
-    thr5.setThrottle(t5);
-    thr6.setThrottle(t6);
-  }
+      latCmd1 = t1;
+      latCmd2 = t2;
+      latCmd3 = t3;
+      latCmd4 = t4;
+      pitchTopCmd = t5;
+      pitchBotCmd = t6;
 
-  lastThrCmdMs = millis();
-  Serial.printf("THR -> %.2f %.2f %.2f %.2f %.2f %.2f\n", t1, t2, t3, t4, t5, t6);
-}else {
+      thr1.setThrottle(t1);
+      thr2.setThrottle(t2);
+      thr3.setThrottle(t3);
+      thr4.setThrottle(t4);
+      thr5.setThrottle(t5);
+      thr6.setThrottle(t6);
+
+      Serial.printf("THR -> %.2f %.2f %.2f %.2f %.2f %.2f, manual timeout=%lu ms\n",
+                    t1, t2, t3, t4, t5, t6, (unsigned long)MANUAL_THR_TIMEOUT_MS);
+    } else {
       Serial.println("ERR: usage THR,t1,t2,t3,t4,t5,t6");
+    }
+
+  } else if (low.startsWith("t")) {
+    char commandLetter = 0;
+    int thrusterNumber = 0;
+    float throttle = 0.0f;
+
+    int itemsRead = sscanf(cmd.c_str(), "%c%d %f", &commandLetter, &thrusterNumber, &throttle);
+    if (itemsRead != 3) {
+      itemsRead = sscanf(cmd.c_str(), "%c%d,%f", &commandLetter, &thrusterNumber, &throttle);
+    }
+
+    if (itemsRead == 3 && (commandLetter == 't' || commandLetter == 'T')) {
+      enterManualThrusterMode();
+      if (setSingleThrusterManual((uint8_t)thrusterNumber, throttle)) {
+        lastThrCmdMs = millis();
+        Serial.printf("T%d -> %.2f, manual timeout=%lu ms\n",
+                      thrusterNumber,
+                      clampf(throttle, 0.0f, 1.0f),
+                      (unsigned long)MANUAL_THR_TIMEOUT_MS);
+      } else {
+        Serial.println("ERR: use t1..t6, example: t1 0.3");
+      }
+    } else {
+      Serial.println("ERR: usage t1 0.3");
     }
 
   } else if (low.startsWith("pth ")) {
   float u = 0.0f;
   int n = sscanf(cmd.c_str(), "pth %f", &u);
   if (n == 1) {
-    pitchCtlEnabled = false;
-    assistEnabled = false;
-    cmdFx = 0.0f;
-    cmdFy = 0.0f;
-    cmdMz = 0.0f;
-    setPitchThrusters(u);
+    enterManualThrusterMode();
+    stopLateralThrusters();
+    setPitchThrustersDirect(u);
     lastThrCmdMs = millis();
-    Serial.printf("Pitch thrusters -> %.2f\n", u);
+    Serial.printf("Pitch thrusters -> %.2f, manual timeout=%lu ms\n",
+                  clampf(u, -1.0f, 1.0f), (unsigned long)MANUAL_THR_TIMEOUT_MS);
   } else {
     Serial.println("Usage: pth <-1..1>");
   }
@@ -609,6 +877,7 @@ void handleCommandLine(const String& in) {
   }
 
   if (matched == 3) {
+    manualThrusterMode = false;
     propCtrlEnabled = true;
     cmdFx = clampf(fx, -1.0f, 1.0f);
     cmdFy = clampf(fy, -1.0f, 1.0f);
@@ -621,6 +890,18 @@ void handleCommandLine(const String& in) {
   } else {
     Serial.println("ERR: usage WRC,fx,fy,mz");
   }
+
+} else if (low == "stop") {
+    manualThrusterMode = false;
+    pitchCtlEnabled = false;
+    yawCtlEnabled = false;
+    propCtrlEnabled = false;
+    assistEnabled = false;
+    cmdFx = 0.0f;
+    cmdFy = 0.0f;
+    cmdMz = 0.0f;
+    stopAllThrusters();
+    Serial.println("All thrusters stopped.");
 
 } else if (low == "mstop") {
     motor.stop();
@@ -660,12 +941,14 @@ void handleCommandLine(const String& in) {
     Serial.printf("Yaw = %.2f deg\n", yawDeg);
 
   } else if (low == "apon") {
+    manualThrusterMode = false;
     pitchCtlEnabled = true;
     pitchPidI = 0.0f;
     pitchPrevE = 0.0f;
     Serial.println("AutoPitch ON (pitch thrusters)");
 
   } else if (low == "apoff") {
+  manualThrusterMode = false;
   pitchCtlEnabled = false;
   assistEnabled = false;
   stopPitchThrusters();
@@ -673,16 +956,19 @@ void handleCommandLine(const String& in) {
   Serial.println("AutoPitch OFF");
 
   } else if (low == "ayon") {
+    manualThrusterMode = false;
     yawCtlEnabled = true;
     yawPrevE = 0.0f;
     Serial.println("AutoYaw ON (lateral thrusters)");
 
   } else if (low == "ayoff") {
+    manualThrusterMode = false;
     yawCtlEnabled = false;
     if (!propCtrlEnabled) stopLateralThrusters();
     Serial.println("AutoYaw OFF");
 
   } else if (low == "atton") {
+    manualThrusterMode = false;
     pitchCtlEnabled = true;
     yawCtlEnabled = true;
     pitchPidI = 0.0f;
@@ -691,6 +977,7 @@ void handleCommandLine(const String& in) {
     Serial.println("Attitude hold ON (pitch + yaw)");
 
   } else if (low == "attoff") {
+    manualThrusterMode = false;
     pitchCtlEnabled = false;
     yawCtlEnabled = false;
     assistEnabled = false;
@@ -698,9 +985,11 @@ void handleCommandLine(const String& in) {
     Serial.println("Attitude hold OFF");
 
   } else if (low == "pron") {
+  manualThrusterMode = false;
   propCtrlEnabled = true;
   Serial.println("Lateral prop control ON");
 } else if (low == "proff") {
+  manualThrusterMode = false;
   propCtrlEnabled = false;
   cmdFx = 0.0f;
   cmdFy = 0.0f;
@@ -796,6 +1085,7 @@ void handleCommandLine(const String& in) {
     }
 
   } else if (low.startsWith("assist ")) {
+    manualThrusterMode = false;
     int ms = 0;
     int n = sscanf(cmd.c_str(), "assist %d", &ms);
     if (n == 1) {
@@ -829,7 +1119,10 @@ void handleCommandLine(const String& in) {
   } else if (low == "status") {
   Serial.println("--- STATUS ---");
   Serial.printf("Motor duty cmd: %.3f\n", motor.lastCommand());
-  Serial.printf("cmdFx=%.2f cmdFy=%.2f cmdMz=%.2f\n", cmdFx, cmdFy, cmdMz);
+  Serial.printf("cmdFx=%.2f cmdFy=%.2f cmdMz=%.2f manualThr=%d manualActive=%d\n",
+                cmdFx, cmdFy, cmdMz, (int)manualThrusterMode, (int)isManualThrusterActive());
+  Serial.printf("THR_TIMEOUT_MS=%lu MANUAL_THR_TIMEOUT_MS=%lu\n",
+                (unsigned long)THR_TIMEOUT_MS, (unsigned long)MANUAL_THR_TIMEOUT_MS);
   Serial.printf("pitchCtl=%d yawCtl=%d propCtrl=%d pitchRef=%.2fdeg yawRef=%.2fdeg pDead=%.2f yDead=%.2f\n",
                 (int)pitchCtlEnabled, (int)yawCtlEnabled, (int)propCtrlEnabled,
                 pitchRefRad * 180.0f / 3.1415926f, yawRefRad * 180.0f / 3.1415926f,
@@ -838,16 +1131,21 @@ void handleCommandLine(const String& in) {
   Serial.printf("T1=%.2f T2=%.2f T3=%.2f T4=%.2f T5=%.2f T6=%.2f\n",
     thr1.lastThrottle(), thr2.lastThrottle(), thr3.lastThrottle(),
     thr4.lastThrottle(), thr5.lastThrottle(), thr6.lastThrottle());
+  Serial.printf("T_us: %d %d %d %d %d %d\n",
+    thr1.lastPulseUs(), thr2.lastPulseUs(), thr3.lastPulseUs(),
+    thr4.lastPulseUs(), thr5.lastPulseUs(), thr6.lastPulseUs());
     
   Serial.printf("ESP-NOW tx_count: %lu\n", (unsigned long)EspNow_txCount());
 
   } else if (low == "arm") {
+    manualThrusterMode = false;
     Serial.println("Arming ESCs...");
     armAllThrusters(3000, 20);
     lastThrCmdMs = millis();
     Serial.println("ESCs armed.");
 
   } else if (low == "disarm") {
+    manualThrusterMode = false;
     pitchCtlEnabled = false;
     yawCtlEnabled = false;
     propCtrlEnabled = false;
@@ -944,38 +1242,50 @@ void EspNowTxTask(void* arg) {
    bool assistActive = assistEnabled && ((int32_t)(millis() - assistEndMs) < 0);
    if (assistEnabled && !assistActive) assistEnabled = false;
 
-   // Pitch hold on dedicated pair T5/T6
-   if (pitchCtlEnabled || assistActive) {
-     if (fabsf(pitchDeg) > pitchSafeDeg) {
+   const bool manualActive = isManualThrusterActive();
+   if (manualThrusterMode && !manualActive) {
+     manualThrusterMode = false;
+     stopAllThrusters();
+   }
+
+   if (manualActive) {
+     // Manual bench commands THR / t1..t6 / pth own the PWM outputs until timeout.
+     lastPitchCmd = 0.0f;
+     lastYawCmd = 0.0f;
+   } else {
+     // Pitch hold on dedicated pair T5/T6
+     if (pitchCtlEnabled || assistActive) {
+       if (fabsf(pitchDeg) > pitchSafeDeg) {
+         lastPitchCmd = 0.0f;
+         stopPitchThrusters();
+       } else if (assistActive) {
+         const float e = pitchRefRad - pitchRad;
+         const float D = assistKd * (e - pitchPrevE) / dt;
+         pitchPrevE = e;
+         lastPitchCmd = clampf(assistKp * e + D, -assistUmax, assistUmax);
+         setPitchThrusters(lastPitchCmd);
+       } else {
+         lastPitchCmd = pitchPidStep(pitchRad, dt);
+         setPitchThrusters(lastPitchCmd);
+       }
+     } else {
        lastPitchCmd = 0.0f;
        stopPitchThrusters();
-     } else if (assistActive) {
-       const float e = pitchRefRad - pitchRad;
-       const float D = assistKd * (e - pitchPrevE) / dt;
-       pitchPrevE = e;
-       lastPitchCmd = clampf(assistKp * e + D, -assistUmax, assistUmax);
-       setPitchThrusters(lastPitchCmd);
-     } else {
-       lastPitchCmd = pitchPidStep(pitchRad, dt);
-       setPitchThrusters(lastPitchCmd);
      }
-   } else {
-     lastPitchCmd = 0.0f;
-     stopPitchThrusters();
-   }
 
-   // Yaw hold runs on the four lateral thrusters and adds to the high-level open-loop cmdMz.
-   float yawHoldMz = 0.0f;
-   if (yawCtlEnabled) {
-     yawHoldMz = yawPidStep(yawRad, dt);
-   }
-   lastYawCmd = yawHoldMz;
+     // Yaw hold runs on the four lateral thrusters and adds to the high-level open-loop cmdMz.
+     float yawHoldMz = 0.0f;
+     if (yawCtlEnabled) {
+       yawHoldMz = yawPidStep(yawRad, dt);
+     }
+     lastYawCmd = yawHoldMz;
 
-   const bool lateralActive = propCtrlEnabled || yawCtlEnabled;
-   if (lateralActive) {
-     setLateralThrustersFromWrench(cmdFx, cmdFy, cmdMz + yawHoldMz);
-   } else {
-     stopLateralThrusters();
+     const bool lateralActive = propCtrlEnabled || yawCtlEnabled;
+     if (lateralActive) {
+       setLateralThrustersFromWrench(cmdFx, cmdFy, cmdMz + yawHoldMz);
+     } else {
+       stopLateralThrusters();
+     }
    }
 
     // Send over ESP-NOW (silently ignore if not initialized)

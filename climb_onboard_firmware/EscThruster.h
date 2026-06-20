@@ -1,4 +1,5 @@
 #pragma once
+
 #include <Arduino.h>
 #include <ESP32Servo.h>
 
@@ -11,16 +12,12 @@ public:
 
   void begin();
 
-  // normalized command [0..1]
   void setThrottle(float x);
 
-  // immediate stop (minimum throttle)
   void stop();
 
-  // re-assert the last pulse width (useful during arming or watchdog handling)
   void refresh();
 
-  // explicit arming helper: keep sending stop pulse at 50 Hz for arm_ms
   void arm(uint32_t arm_ms = 3000, uint32_t period_ms = 20);
 
   float lastThrottle() const { return throttle_; }

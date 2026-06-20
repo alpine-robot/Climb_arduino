@@ -9,7 +9,7 @@ EscThruster::EscThruster(uint8_t pin, int min_us, int max_us, int stop_us)
   throttle_(0.0f) {}
 
 void EscThruster::begin() {
-  esc_.setPeriodHertz(50);      // standard RC/ESC pulse train
+  esc_.setPeriodHertz(50);
   esc_.attach(pin_, minUs_, maxUs_);
   stop();
 }
@@ -22,9 +22,13 @@ void EscThruster::writeUs(int us) {
 void EscThruster::setThrottle(float x) {
   if (x < 0.0f) x = 0.0f;
   if (x > 1.0f) x = 1.0f;
+
   throttle_ = x;
 
+  // 0.0 = 1000 us stop
+  // 1.0 = 2000 us full throttle
   const int us = minUs_ + static_cast<int>((maxUs_ - minUs_) * throttle_);
+
   writeUs(us);
 }
 
@@ -39,6 +43,7 @@ void EscThruster::refresh() {
 
 void EscThruster::arm(uint32_t arm_ms, uint32_t period_ms) {
   const uint32_t t0 = millis();
+
   while ((millis() - t0) < arm_ms) {
     stop();
     delay(period_ms);
