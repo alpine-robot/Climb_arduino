@@ -59,6 +59,29 @@ Serial Commands
 // ── Peer (of dongle) MAC address — CHANGE THIS ───────────────────────────────────
 uint8_t DONGLE_MAC[6] = { 0x50, 0x78, 0x7D, 0x16, 0xA9, 0x0C };
 
+// Set to -1 if positive IMU pitch means nose-up.
+// Set to +1 if positive IMU pitch means nose-down.
+static constexpr float PITCH_PID_OUTPUT_SIGN = -1.0f;
+
+static constexpr float YAW_PID_OUTPUT_SIGN = +1.0f;
+// Runtime serial mode.
+// Default = Arduino Serial Monitor / manual bench mode.
+// ROS will switch this at runtime by sending: "ros on".
+volatile bool rosSerialBridgeMode = false;
+
+// Default off, otherwise Arduino Serial Monitor gets flooded.
+// ROS enables it at runtime.
+volatile bool usbTelemetryEnabled = false;
+
+// 100 Hz / 5 = 20 Hz when enabled.
+static constexpr uint8_t USB_TELEMETRY_DIV_DEFAULT = 5;
+volatile uint8_t usbTelemetryDiv = USB_TELEMETRY_DIV_DEFAULT;
+static uint8_t usbTelemCounter = 0;
+
+// Keep false for the USB-serial test.
+// You can still turn this into a runtime command later if needed.
+volatile bool espnowTelemetryEnabled = false;
+
 // ── Pins (adjust if needed) ───────────────────────────────────────────────────
 static constexpr uint8_t SERVO1_PIN = 35;
 static constexpr uint8_t SERVO2_PIN = 36;
@@ -257,7 +280,7 @@ static constexpr float FX_GAIN = 1.0f;
 static constexpr float FY_GAIN = 1.0f;
 static constexpr float MZ_GAIN = 1.0f;
 static constexpr float THR_MAX = 1.0f;
-
+static constexpr float THR_MIN_ACTIVE = 0.40f;
 // assist mode ----------------------------------------------------
 volatile bool assistEnabled = false;
 volatile uint32_t assistEndMs = 0;
@@ -288,7 +311,20 @@ static float lastPitchCmd      = 0.0f;
 static float lastYawCmd        = 0.0f;
 
 
+static inline float applyMinActiveSigned(float u, float minActive, float maxActive) {
+  u = clampf(u, -maxActive, maxActive);
 
+  if (fabsf(u) < 1e-5f) {
+    return 0.0f;
+  }
+
+  float a = fabsf(u);
+  if (a < minActive) {
+    a = minActive;
+  }
+
+  return (u > 0.0f) ? a : -a;
+}
 // Attitude for propeller stabilization must come from the BODY IMU.
 // In alpine_odometry_node.py the mapping is:
 //   IMU1 = rope IMU
@@ -311,23 +347,41 @@ bool readLine(String& out) {
 
     if (c == '\r' || c == '\n') {
       out.trim();
-      return out.length() > 0;
+
+      if (out.length() == 0) {
+        out = "";
+        return false;
+      }
+
+      return true;
     }
 
     out += c;
 
     if (out.length() > SERIAL_MAX_LINE_LEN) {
       out = "";
-      Serial.println("ERR: serial command too long, buffer cleared.");
+
+      if (!rosSerialBridgeMode) {
+        Serial.println("ERR: serial command too long, buffer cleared.");
+      }
+
       return false;
     }
   }
 
-  // Same behaviour as the low-level tester: command is accepted after a short idle time
-  // even if no newline is sent.
-  if (out.length() > 0 && (millis() - lastSerialCharMs) >= SERIAL_IDLE_COMMAND_MS) {
+  // Solo per Arduino Serial Monitor / test manuali.
+  // In ROS mode NO: il nodo ROS manda già newline.
+  if (!rosSerialBridgeMode &&
+      out.length() > 0 &&
+      (millis() - lastSerialCharMs) >= SERIAL_IDLE_COMMAND_MS) {
     out.trim();
-    return out.length() > 0;
+
+    if (out.length() == 0) {
+      out = "";
+      return false;
+    }
+
+    return true;
   }
 
   return false;
@@ -441,9 +495,11 @@ static float pitchPidStep(float pitchRad, float dt) {
   pitchPrevE = e;
 
   float u = P + pitchPidI + D;
-  float uSat = clampf(u, -pitchUmax, pitchUmax);
-  if (u != uSat) pitchPidI *= 0.95f;
-  return uSat;
+float uSat = clampf(u, -pitchUmax, pitchUmax);
+
+if (u != uSat) pitchPidI *= 0.95f;
+
+return applyMinActiveSigned(uSat, THR_MIN_ACTIVE, pitchUmax);
 }
 
 static float yawPidStep(float yawRad, float dt) {
@@ -454,7 +510,9 @@ static float yawPidStep(float yawRad, float dt) {
   float D = yawKd * (e - yawPrevE) / dt;
   yawPrevE = e;
   float u = yawKp * e + D;
-  return clampf(u, -yawUmax, yawUmax);
+float uSat = clampf(u, -yawUmax, yawUmax);
+
+return applyMinActiveSigned(uSat, THR_MIN_ACTIVE, yawUmax);
 }
 
 // opzionale: rampetta per non dare step bruschi agli ESC
@@ -565,23 +623,26 @@ static inline void setLateralThrustersFromWrench(float fx, float fy, float mz) {
   float t4 = 0.0f;
 
   // Yaw allocation according to agreed propeller pairs:
-  // +Mz => Y1 + Y3 => T1 + T3
-  // -Mz => Y2 + Y4 => T2 + T4
+  // -Mz => right => T1 + T3
+  // +Mz => left  => T2 + T4
   if (mz > 0.0f) {
-    t1 += MZ_GAIN * mz;
-    t3 += MZ_GAIN * mz;
+    t2 += MZ_GAIN * mz;
+    t4 += MZ_GAIN * mz;
   } else if (mz < 0.0f) {
-    t2 += MZ_GAIN * (-mz);
-    t4 += MZ_GAIN * (-mz);
+    t1 += MZ_GAIN * (-mz);
+    t3 += MZ_GAIN * (-mz);
   }
 
   // Tangential motion on the wall (keep as config-driven bias, tune after real mounting)
+   // Lateral translation on the wall:
+  // -Fy => left  => T1 + T2
+  // +Fy => right => T3 + T4
   if (fy > 0.0f) {
-    t2 += FY_GAIN * fy;
     t3 += FY_GAIN * fy;
+    t4 += FY_GAIN * fy;
   } else if (fy < 0.0f) {
     t1 += FY_GAIN * (-fy);
-    t4 += FY_GAIN * (-fy);
+    t2 += FY_GAIN * (-fy);
   }
 
   // Normal push/pull bias (placeholder until full geometry allocation is identified)
@@ -705,27 +766,33 @@ void setup() {
       EspNowTxTask, "espnow_tx", 4096, nullptr, 1, nullptr, APP_CPU_NUM);
   if (ok != pdPASS) Serial.println("[ESP-NOW] ERROR: TX task create failed!");
 
+ 
   Serial.println("Ready.");
-  printHelp();
-  Serial.print("> ");
+printHelp();
+Serial.print("> ");
 }
 // ── Loop ──────────────────────────────────────────────────────────────────────
 void loop() {
   // Parse Serial commands
   //Serial.println("hello!");
-  if (readLine(line)) {
-    String cmd = line;
-    cmd.trim();
-    line = "";
+ if (readLine(line)) {
+  String cmd = line;
+  cmd.trim();
+  line = "";
 
-    if (cmd.length() > 0) {
+  if (cmd.length() > 0) {
+    if (!rosSerialBridgeMode) {
       Serial.print("RX: ");
       Serial.println(cmd);
-      handleCommandLine(cmd);  // shared parser
     }
 
+    handleCommandLine(cmd);
+  }
+
+  if (!rosSerialBridgeMode) {
     Serial.print("> ");
   }
+}
 
   // Pump ESP-NOW RX queue → dispatches to handleCommandLine()
   EspNow_loop();
@@ -777,6 +844,56 @@ void handleCommandLine(const String& in) {
   cmd.trim();
   String low = cmd;
   low.toLowerCase();
+
+  if (low == "ros on" || low == "roson" || low == "bridge on") {
+    rosSerialBridgeMode = true;
+    usbTelemetryEnabled = true;
+    usbTelemetryDiv = USB_TELEMETRY_DIV_DEFAULT;
+    usbTelemCounter = 0;
+
+    Serial.printf("OK ros on usbtelem_div=%u\n", usbTelemetryDiv);
+    return;
+
+  } else if (low == "ros off" || low == "rosoff" || low == "console") {
+    usbTelemetryEnabled = false;
+    rosSerialBridgeMode = false;
+    usbTelemCounter = 0;
+
+    Serial.println("OK console mode");
+    printHelp();
+    Serial.print("> ");
+    return;
+
+  } else if (low == "usbtelem off" || low == "usbtelem 0" || low == "telem off") {
+    usbTelemetryEnabled = false;
+    usbTelemCounter = 0;
+
+    Serial.println("OK usbtelem off");
+    return;
+
+  } else if (low.startsWith("usbtelem ")) {
+    String arg = low.substring(String("usbtelem ").length());
+    arg.trim();
+
+    int div = arg.toInt();
+    if (div < 1) div = USB_TELEMETRY_DIV_DEFAULT;
+    if (div > 100) div = 100;
+
+    usbTelemetryDiv = (uint8_t)div;
+    usbTelemetryEnabled = true;
+    usbTelemCounter = 0;
+
+    Serial.printf("OK usbtelem div=%u\n", usbTelemetryDiv);
+    return;
+
+  } else if (low == "telem on") {
+    usbTelemetryEnabled = true;
+    usbTelemetryDiv = USB_TELEMETRY_DIV_DEFAULT;
+    usbTelemCounter = 0;
+
+    Serial.printf("OK telem on div=%u\n", usbTelemetryDiv);
+    return;
+  }
 
   if (low == "ping") {
     Serial.println("pong");
@@ -1218,77 +1335,97 @@ String buildDualImuCsv() {
   return out;
 }
 
-// ── 100 Hz ESP-NOW TX task ───────────────────────────────────────────────────
+// ── 100 Hz body control + telemetry task ─────────────────────────────────────
 void EspNowTxTask(void* arg) {
   (void)arg;
   const TickType_t period = pdMS_TO_TICKS(10); // 100 Hz
   TickType_t next = xTaskGetTickCount();
   const float dt = 0.01f;
+
   for (;;) {
     vTaskDelayUntil(&next, period);
 
     String csv = buildDualImuCsv();
-    // Optional: echo to USB for debug
-    // Serial.print(csv);
 
-   // Onboard attitude stabilization should live here (time-critical),
-   // while high-level ROS only sends bias wrench commands.
-   float q[4];
-   getAttitudeQuat(q);
-   const float pitchRad = pitchFromQuatWXYZ(q[0], q[1], q[2], q[3]);
-   const float yawRad   = yawFromQuatWXYZ(q[0], q[1], q[2], q[3]);
-   const float pitchDeg = pitchRad * 180.0f / 3.1415926f;
+    // Telemetry verso ROS su USB seriale, decimata.
+    // 100 Hz / 5 = 20 Hz con USB a 115200.
+    if (usbTelemetryEnabled) {
+  uint8_t div = usbTelemetryDiv;
+  if (div < 1) div = 1;
 
-   bool assistActive = assistEnabled && ((int32_t)(millis() - assistEndMs) < 0);
-   if (assistEnabled && !assistActive) assistEnabled = false;
+  usbTelemCounter++;
+  if (usbTelemCounter >= div) {
+    usbTelemCounter = 0;
+    Serial.print(csv);
+  }
+}
 
-   const bool manualActive = isManualThrusterActive();
-   if (manualThrusterMode && !manualActive) {
-     manualThrusterMode = false;
-     stopAllThrusters();
-   }
+    // Onboard attitude stabilization should live here (time-critical),
+    // while high-level ROS only sends bias wrench commands.
+    float q[4];
+    getAttitudeQuat(q);
+    const float pitchRad = pitchFromQuatWXYZ(q[0], q[1], q[2], q[3]);
+    const float yawRad   = yawFromQuatWXYZ(q[0], q[1], q[2], q[3]);
+    const float pitchDeg = pitchRad * 180.0f / 3.1415926f;
 
-   if (manualActive) {
-     // Manual bench commands THR / t1..t6 / pth own the PWM outputs until timeout.
-     lastPitchCmd = 0.0f;
-     lastYawCmd = 0.0f;
-   } else {
-     // Pitch hold on dedicated pair T5/T6
-     if (pitchCtlEnabled || assistActive) {
-       if (fabsf(pitchDeg) > pitchSafeDeg) {
-         lastPitchCmd = 0.0f;
-         stopPitchThrusters();
-       } else if (assistActive) {
-         const float e = pitchRefRad - pitchRad;
-         const float D = assistKd * (e - pitchPrevE) / dt;
-         pitchPrevE = e;
-         lastPitchCmd = clampf(assistKp * e + D, -assistUmax, assistUmax);
-         setPitchThrusters(lastPitchCmd);
-       } else {
-         lastPitchCmd = pitchPidStep(pitchRad, dt);
-         setPitchThrusters(lastPitchCmd);
-       }
-     } else {
-       lastPitchCmd = 0.0f;
-       stopPitchThrusters();
+    bool assistActive = assistEnabled && ((int32_t)(millis() - assistEndMs) < 0);
+    if (assistEnabled && !assistActive) assistEnabled = false;
+
+    const bool manualActive = isManualThrusterActive();
+
+    if (manualThrusterMode && !manualActive) {
+      manualThrusterMode = false;
+      stopAllThrusters();
+    }
+
+    if (manualActive) {
+      // Manual bench commands THR / t1..t6 / pth own the PWM outputs until timeout.
+      lastPitchCmd = 0.0f;
+      lastYawCmd = 0.0f;
+
+    } else {
+      // Pitch hold on dedicated pair T5/T6
+      if (pitchCtlEnabled || assistActive) {
+        if (fabsf(pitchDeg) > pitchSafeDeg) {
+          lastPitchCmd = 0.0f;
+          stopPitchThrusters();
+
+        } else if (assistActive) {
+          const float e = pitchRefRad - pitchRad;
+          const float D = assistKd * (e - pitchPrevE) / dt;
+          pitchPrevE = e;
+          lastPitchCmd = clampf(assistKp * e + D, -assistUmax, assistUmax);
+          setPitchThrusters(lastPitchCmd);
+
+        } else {
+          lastPitchCmd = pitchPidStep(pitchRad, dt);
+          setPitchThrusters(PITCH_PID_OUTPUT_SIGN * lastPitchCmd);
+        }
+
+      } else {
+        lastPitchCmd = 0.0f;
+        stopPitchThrusters();
+      }
+
+      // Yaw hold runs on the four lateral thrusters and adds to the high-level open-loop cmdMz.
+      float yawHoldMz = 0.0f;
+        if (yawCtlEnabled) {
+        yawHoldMz = YAW_PID_OUTPUT_SIGN * yawPidStep(yawRad, dt);
+      }
+
+      lastYawCmd = yawHoldMz;
+
+      const bool lateralActive = propCtrlEnabled || yawCtlEnabled;
+      if (lateralActive) {
+          setLateralThrustersFromWrench(cmdFx, cmdFy, cmdMz + yawHoldMz);
+      } else {
+        stopLateralThrusters();
+      }
+    }
+
+    // ESP-NOW spento per test ROS via USB seriale.
+    if (espnowTelemetryEnabled) {
+      EspNow_send(csv);
      }
-
-     // Yaw hold runs on the four lateral thrusters and adds to the high-level open-loop cmdMz.
-     float yawHoldMz = 0.0f;
-     if (yawCtlEnabled) {
-       yawHoldMz = yawPidStep(yawRad, dt);
-     }
-     lastYawCmd = yawHoldMz;
-
-     const bool lateralActive = propCtrlEnabled || yawCtlEnabled;
-     if (lateralActive) {
-       setLateralThrustersFromWrench(cmdFx, cmdFy, cmdMz + yawHoldMz);
-     } else {
-       stopLateralThrusters();
-     }
-   }
-
-    // Send over ESP-NOW (silently ignore if not initialized)
-    EspNow_send(csv);
   }
 }
