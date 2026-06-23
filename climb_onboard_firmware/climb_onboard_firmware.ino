@@ -63,7 +63,21 @@ uint8_t DONGLE_MAC[6] = { 0x50, 0x78, 0x7D, 0x16, 0xA9, 0x0C };
 // Set to +1 if positive IMU pitch means nose-down.
 static constexpr float PITCH_PID_OUTPUT_SIGN = -1.0f;
 
-static constexpr float YAW_PID_OUTPUT_SIGN = +1.0f;
+static constexpr float YAW_PID_OUTPUT_SIGN = 1.0f;
+
+static bool pitchHoldActiveBand = false;
+static bool yawHoldActiveBand = false;
+static bool  yawHoldInit       = false;
+static float yawLastRad        = 0.0f;
+static float yawRateFilt       = 0.0f;
+
+// Soglie yaw robuste
+volatile float yawDeadOutDeg      = 8.0f;  // parte solo sopra questa soglia
+volatile float yawDriftRateDegS   = 1.5f;   // sotto questa velocità considero drift lento
+volatile float yawDriftBandDeg    = 30.0f;  // compenso drift solo entro questa banda
+volatile float yawDriftAlpha      = 0.0015f;
+
+
 // Runtime serial mode.
 // Default = Arduino Serial Monitor / manual bench mode.
 // ROS will switch this at runtime by sending: "ros on".
@@ -280,7 +294,11 @@ static constexpr float FX_GAIN = 1.0f;
 static constexpr float FY_GAIN = 1.0f;
 static constexpr float MZ_GAIN = 1.0f;
 static constexpr float THR_MAX = 1.0f;
-static constexpr float THR_MIN_ACTIVE = 0.40f;
+static constexpr float PITCH_MIN_ACTIVE = 0.80f;
+static constexpr float YAW_MIN_ACTIVE   = 0.60f;
+
+static constexpr float PITCH_RAMP_STEP   = 0.10f;
+static constexpr float LATERAL_RAMP_STEP = 0.08f;
 // assist mode ----------------------------------------------------
 volatile bool assistEnabled = false;
 volatile uint32_t assistEndMs = 0;
@@ -305,13 +323,21 @@ volatile float yawRefRad       = 0.0f;
 volatile float yawKp           = 0.9f;
 volatile float yawKd           = 0.04f;
 volatile float yawUmax         = 0.45f;
-volatile float yawDeadDeg      = 3.0f;   // "dritto" band
-static float yawPrevE          = 0.0f;
+volatile float yawDeadDeg      = 3.0f;
+
+// Yaw robusto contro drift lento IMU
+volatile float yawDeadOutExtraDeg = 8.0f;   // con ydb=10 parte sopra circa 18 deg
+
+
+static float yawPrevE             = 0.0f;
+
 static float lastPitchCmd      = 0.0f;
 static float lastYawCmd        = 0.0f;
 
-
 static inline float applyMinActiveSigned(float u, float minActive, float maxActive) {
+  maxActive = clampf(maxActive, 0.0f, 1.0f);
+  minActive = clampf(minActive, 0.0f, maxActive);
+
   u = clampf(u, -maxActive, maxActive);
 
   if (fabsf(u) < 1e-5f) {
@@ -482,15 +508,30 @@ static float yawFromQuatWXYZ(float w, float x, float y, float z) {
   float cosy = 1.0f - 2.0f * (y*y + z*z);
   return atan2f(siny, cosy);
 }
-
 static float pitchPidStep(float pitchRad, float dt) {
   float e = pitchRefRad - pitchRad;
-  const float dead = pitchDeadDeg * (3.1415926f / 180.0f);
-  if (fabsf(e) < dead) e = 0.0f;
+
+  const float deadIn  = pitchDeadDeg * (3.1415926f / 180.0f);
+  const float deadOut = (pitchDeadDeg + 3.0f) * (3.1415926f / 180.0f);
+
+  float ae = fabsf(e);
+
+  if (ae < deadIn) {
+    pitchHoldActiveBand = false;
+  } else if (ae > deadOut) {
+    pitchHoldActiveBand = true;
+  }
+
+  if (!pitchHoldActiveBand) {
+    pitchPidI = 0.0f;
+    pitchPrevE = 0.0f;
+    return 0.0f;
+  }
 
   float P = pitchKp * e;
   pitchPidI += pitchKi * e * dt;
   pitchPidI = clampf(pitchPidI, -0.5f, 0.5f);
+
   float D = pitchKd * (e - pitchPrevE) / dt;
   pitchPrevE = e;
 
@@ -499,20 +540,75 @@ float uSat = clampf(u, -pitchUmax, pitchUmax);
 
 if (u != uSat) pitchPidI *= 0.95f;
 
-return applyMinActiveSigned(uSat, THR_MIN_ACTIVE, pitchUmax);
+return applyMinActiveSigned(uSat, PITCH_MIN_ACTIVE, pitchUmax);
 }
 
 static float yawPidStep(float yawRad, float dt) {
+  if (dt <= 1e-5f) {
+    return 0.0f;
+  }
+
+  if (!yawHoldInit) {
+    yawHoldInit = true;
+    yawLastRad = yawRad;
+    yawRateFilt = 0.0f;
+    yawPrevE = 0.0f;
+    yawHoldActiveBand = false;
+    return 0.0f;
+  }
+
+  // Velocità yaw misurata
+  float dy = wrapPi(yawRad - yawLastRad);
+  yawLastRad = yawRad;
+
+  float yawRate = dy / dt;
+  yawRateFilt = 0.92f * yawRateFilt + 0.08f * yawRate;
+
   float e = wrapPi(yawRefRad - yawRad);
-  const float dead = yawDeadDeg * (3.1415926f / 180.0f);
-  if (fabsf(e) < dead) e = 0.0f;
 
-  float D = yawKd * (e - yawPrevE) / dt;
-  yawPrevE = e;
-  float u = yawKp * e + D;
-float uSat = clampf(u, -yawUmax, yawUmax);
+  const float deadIn    = yawDeadDeg * (3.1415926f / 180.0f);
+  const float deadOut   = (yawDeadDeg + yawDeadOutExtraDeg) * (3.1415926f / 180.0f);
+  const float driftRate = yawDriftRateDegS * (3.1415926f / 180.0f);
+  const float driftBand = yawDriftBandDeg * (3.1415926f / 180.0f);
 
-return applyMinActiveSigned(uSat, THR_MIN_ACTIVE, yawUmax);
+  // Se lo yaw si sposta lentamente e siamo in una banda ragionevole,
+  // lo considero drift IMU, non rotazione reale.
+  if (!yawHoldActiveBand &&
+      fabsf(e) < driftBand &&
+      fabsf(yawRateFilt) < driftRate) {
+
+    yawRefRad = wrapPi(yawRefRad - yawDriftAlpha * e);
+    e = wrapPi(yawRefRad - yawRad);
+  }
+
+  // Deadband con isteresi
+  if (fabsf(e) < deadIn) {
+    yawHoldActiveBand = false;
+    yawPrevE = 0.0f;
+    return 0.0f;
+  }
+
+  if (fabsf(e) > deadOut) {
+    yawHoldActiveBand = true;
+  }
+
+  if (!yawHoldActiveBand) {
+    yawPrevE = 0.0f;
+
+    // Smorzamento solo se ruota davvero veloce anche nella zona intermedia
+    if (fabsf(yawRateFilt) > 3.0f * driftRate) {
+      float uDamp = -yawKd * yawRateFilt;
+     return applyMinActiveSigned(uDamp, YAW_MIN_ACTIVE, yawUmax);
+    }
+
+    return 0.0f;
+  }
+
+  // P sulla posizione + D sulla velocità reale
+  float u = yawKp * e - yawKd * yawRateFilt;
+  u = clampf(u, -yawUmax, yawUmax);
+
+  return applyMinActiveSigned(u, YAW_MIN_ACTIVE, yawUmax);
 }
 
 // opzionale: rampetta per non dare step bruschi agli ESC
@@ -593,6 +689,23 @@ static inline void printThrusterAttachStatus(const char* name, uint8_t pin, uint
 
 
 
+static inline float pitchActiveTarget(float x) {
+  x = clampf(x, 0.0f, 1.0f);
+
+  const float maxPitch = clampf(pitchUmax, 0.0f, 1.0f);
+  const float minPitch = clampf(PITCH_MIN_ACTIVE, 0.0f, maxPitch);
+
+  if (x <= 1e-5f) {
+    return 0.0f;
+  }
+
+  if (x < minPitch) {
+    x = minPitch;
+  }
+
+  return clampf(x, 0.0f, maxPitch);
+}
+
 static inline void setPitchThrusters(float pitchCmd) {
   pitchCmd = clampf(pitchCmd, -1.0f, 1.0f);
 
@@ -600,13 +713,42 @@ static inline void setPitchThrusters(float pitchCmd) {
   float t6_target = 0.0f;
 
   if (pitchCmd > 0.0f) {
-    t5_target = pitchCmd;
+    t5_target = pitchActiveTarget(pitchCmd);
   } else if (pitchCmd < 0.0f) {
-    t6_target = -pitchCmd;
+    t6_target = pitchActiveTarget(-pitchCmd);
   }
 
-  pitchTopCmd = rampTowards(pitchTopCmd, t5_target, 0.03f);
-  pitchBotCmd = rampTowards(pitchBotCmd, t6_target, 0.03f);
+  // T5 active
+  if (t5_target > 0.0f) {
+    pitchBotCmd = 0.0f;
+
+    if (pitchTopCmd < PITCH_MIN_ACTIVE) {
+      pitchTopCmd = PITCH_MIN_ACTIVE;   // parte subito da 0.8
+    } else {
+      pitchTopCmd = rampTowards(pitchTopCmd, t5_target, PITCH_RAMP_STEP);
+    }
+
+    pitchTopCmd = clampf(pitchTopCmd, PITCH_MIN_ACTIVE, pitchUmax);
+  }
+
+  // T6 active
+  else if (t6_target > 0.0f) {
+    pitchTopCmd = 0.0f;
+
+    if (pitchBotCmd < PITCH_MIN_ACTIVE) {
+      pitchBotCmd = PITCH_MIN_ACTIVE;   // parte subito da 0.8
+    } else {
+      pitchBotCmd = rampTowards(pitchBotCmd, t6_target, PITCH_RAMP_STEP);
+    }
+
+    pitchBotCmd = clampf(pitchBotCmd, PITCH_MIN_ACTIVE, pitchUmax);
+  }
+
+  // dentro deadband: spento
+  else {
+    pitchTopCmd = 0.0f;
+    pitchBotCmd = 0.0f;
+  }
 
   thr5.setThrottle(pitchTopCmd);
   thr6.setThrottle(pitchBotCmd);
@@ -659,10 +801,10 @@ static inline void setLateralThrustersFromWrench(float fx, float fy, float mz) {
   t3 = clampf(t3, 0.0f, THR_MAX);
   t4 = clampf(t4, 0.0f, THR_MAX);
 
-  latCmd1 = rampTowards(latCmd1, t1, 0.04f);
-  latCmd2 = rampTowards(latCmd2, t2, 0.04f);
-  latCmd3 = rampTowards(latCmd3, t3, 0.04f);
-  latCmd4 = rampTowards(latCmd4, t4, 0.04f);
+  latCmd1 = rampTowards(latCmd1, t1, LATERAL_RAMP_STEP);
+  latCmd2 = rampTowards(latCmd2, t2, LATERAL_RAMP_STEP);
+  latCmd3 = rampTowards(latCmd3, t3, LATERAL_RAMP_STEP);
+  latCmd4 = rampTowards(latCmd4, t4, LATERAL_RAMP_STEP);
 
   thr1.setThrottle(latCmd1);
   thr2.setThrottle(latCmd2);
@@ -1126,6 +1268,9 @@ void handleCommandLine(const String& in) {
     getAttitudeQuat(q);
     yawRefRad = yawFromQuatWXYZ(q[0], q[1], q[2], q[3]);
     yawPrevE = 0.0f;
+    yawHoldInit = false;
+    yawHoldActiveBand = false;
+    yawRateFilt = 0.0f;
     Serial.println("AutoYaw reference set (ayzero)");
 
   } else if (low == "attzero") {
@@ -1136,6 +1281,9 @@ void handleCommandLine(const String& in) {
     pitchPidI = 0.0f;
     pitchPrevE = 0.0f;
     yawPrevE = 0.0f;
+    yawHoldInit = false;
+    yawHoldActiveBand = false;
+    yawRateFilt = 0.0f;
     Serial.println("Pitch+Yaw references set from current attitude");
 
   } else if (low.startsWith("pid ")) {
