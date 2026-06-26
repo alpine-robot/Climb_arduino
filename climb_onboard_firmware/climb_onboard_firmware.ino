@@ -768,11 +768,11 @@ static inline void setLateralThrustersFromWrench(float fx, float fy, float mz) {
   // -Mz => right => T1 + T3
   // +Mz => left  => T2 + T4
   if (mz > 0.0f) {
-    t2 += MZ_GAIN * mz;
-    t4 += MZ_GAIN * mz;
+    t1 += MZ_GAIN * mz;
+    t3 += MZ_GAIN * mz;
   } else if (mz < 0.0f) {
-    t1 += MZ_GAIN * (-mz);
-    t3 += MZ_GAIN * (-mz);
+    t2 += MZ_GAIN * (-mz);
+    t4 += MZ_GAIN * (-mz);
   }
 
   // Tangential motion on the wall (keep as config-driven bias, tune after real mounting)
@@ -780,20 +780,20 @@ static inline void setLateralThrustersFromWrench(float fx, float fy, float mz) {
   // -Fy => left  => T1 + T2
   // +Fy => right => T3 + T4
   if (fy > 0.0f) {
-    t3 += FY_GAIN * fy;
-    t4 += FY_GAIN * fy;
+    t1 += FY_GAIN * fy;
+    t2 += FY_GAIN * fy;
   } else if (fy < 0.0f) {
-    t1 += FY_GAIN * (-fy);
-    t2 += FY_GAIN * (-fy);
+    t3 += FY_GAIN * (-fy);
+    t4 += FY_GAIN * (-fy);
   }
 
   // Normal push/pull bias (placeholder until full geometry allocation is identified)
   if (fx > 0.0f) {
-    t2 += FX_GAIN * fx;
-    t3 += FX_GAIN * fx;
+    t1 += FX_GAIN * fx;
+    t4 += FX_GAIN * fx;
   } else if (fx < 0.0f) {
-    t1 += FX_GAIN * (-fx);
-    t4 += FX_GAIN * (-fx);
+    t2 += FX_GAIN * (-fx);
+    t3 += FX_GAIN * (-fx);
   }
 
   t1 = clampf(t1, 0.0f, THR_MAX);
